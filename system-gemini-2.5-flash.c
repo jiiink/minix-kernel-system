@@ -88,34 +88,32 @@ static int kernel_call_dispatch(struct proc * caller, message *msg)
   int call_nr;
 
 #if DEBUG_IPC_HOOK
-	hook_ipc_msgkcall(msg, caller);
+  hook_ipc_msgkcall(msg, caller);
 #endif
 
   call_nr = msg->m_type - KERNEL_CALL;
 
-  /* Validate call number range. */
+  /* 1. Validate call number range. */
   if (call_nr < 0 || call_nr >= NR_SYS_CALLS) {
-	  printf("SYSTEM: illegal request %d from %d.\n",
-			  call_nr, msg->m_source);
-	  return EBADREQUEST;
+    printf("SYSTEM: illegal request %d from %d.\n", call_nr, msg->m_source);
+    return EBADREQUEST;
   }
 
-  /* Check caller's permissions for this call. */
+  /* 2. Validate caller permissions for this specific kernel call. */
   if (!GET_BIT(priv(caller)->s_k_call_mask, call_nr)) {
-	  printf("SYSTEM: denied request %d from %d.\n",
-			  call_nr, msg->m_source);
-	  return ECALLDENIED;
+    printf("SYSTEM: denied request %d from %d.\n", call_nr, msg->m_source);
+    return ECALLDENIED;
   }
 
-  /* Dispatch the system call if implemented. */
+  /* 3. Dispatch the system call if a handler is registered. */
   if (call_vec[call_nr]) {
-	  return (*call_vec[call_nr])(caller, msg);
+    return (*call_vec[call_nr])(caller, msg);
+  } else {
+    /* This path indicates a valid, permitted call_nr but no handler defined.
+     * It suggests an inconsistency between NR_SYS_CALLS/s_k_call_mask and call_vec. */
+    printf("Unused kernel call %d from %d\n", call_nr, caller->p_endpoint);
+    return EBADREQUEST;
   }
-
-  /* Handle unimplemented/unused kernel calls. */
-  printf("Unused kernel call %d from %d\n",
-		  call_nr, caller->p_endpoint);
-  return EBADREQUEST;
 }
 
 /*===========================================================================*
@@ -127,181 +125,141 @@ static int kernel_call_dispatch(struct proc * caller, message *msg)
  */
 void kernel_call(message *m_user, struct proc * caller)
 {
+  message msg;
+  int dispatch_result;
+
   caller->p_delivermsg_vir = (vir_bytes) m_user;
 
-  message msg;
-  if (copy_msg_from_user(m_user, &msg) != OK) {
+  if (copy_msg_from_user(m_user, &msg) != 0) {
 	  printf("WARNING wrong user pointer 0x%08x from process %s / %d\n",
-			  (unsigned int)m_user, caller->p_name, caller->p_endpoint);
+			  m_user, caller->p_name, caller->p_endpoint);
 	  cause_sig(proc_nr(caller), SIGSEGV);
 	  return;
   }
 
   msg.m_source = caller->p_endpoint;
-  int result = kernel_call_dispatch(caller, &msg);
+  dispatch_result = kernel_call_dispatch(caller, &msg);
 
   kbill_kcall = caller;
 
-  kernel_call_finish(caller, &msg, result);
+  kernel_call_finish(caller, &msg, dispatch_result);
 }
 
 /*===========================================================================*
  *				initialize				     *
  *===========================================================================*/
-static void init_irq_hooks(void)
+void system_init(void)
 {
+  struct priv *sp;
   int i;
+
+  /* Initialize IRQ handler hooks. Mark all hooks available. */
   for (i=0; i<NR_IRQ_HOOKS; i++) {
       irq_hooks[i].proc_nr_e = NONE;
   }
-}
 
-static void init_alarm_timers(void)
-{
-  struct priv *sp;
+  /* Initialize all alarm timers for all processes. */
   for (sp=BEG_PRIV_ADDR; sp < END_PRIV_ADDR; sp++) {
     tmr_inittimer(&(sp->s_alarm_timer));
   }
-}
 
-static void init_syscall_vectors(void)
-{
-  memset(call_vec, 0, sizeof(call_vec));
-}
+  /* Initialize the call vector to a safe default handler. Some system calls
+   * may be disabled or nonexistant. Then explicitly map known calls to their
+   * handler functions. This is done with a macro that gives a compile error
+   * if an illegal call number is used. The ordering is not important here.
+   */
+  for (i=0; i<NR_SYS_CALLS; i++) {
+      call_vec[i] = NULL;
+  }
 
-static void map_process_management_calls(void)
-{
-  map(SYS_FORK, do_fork);
-  map(SYS_EXEC, do_exec);
-  map(SYS_CLEAR, do_clear);
-  map(SYS_EXIT, do_exit);
-  map(SYS_PRIVCTL, do_privctl);
-  map(SYS_TRACE, do_trace);
-  map(SYS_SETGRANT, do_setgrant);
-  map(SYS_RUNCTL, do_runctl);
-  map(SYS_UPDATE, do_update);
-  map(SYS_STATECTL, do_statectl);
-}
+  /* Process management. */
+  map(SYS_FORK, do_fork); 		/* a process forked a new process */
+  map(SYS_EXEC, do_exec);		/* update process after execute */
+  map(SYS_CLEAR, do_clear);		/* clean up after process exit */
+  map(SYS_EXIT, do_exit);		/* a system process wants to exit */
+  map(SYS_PRIVCTL, do_privctl);		/* system privileges control */
+  map(SYS_TRACE, do_trace);		/* request a trace operation */
+  map(SYS_SETGRANT, do_setgrant);	/* get/set own parameters */
+  map(SYS_RUNCTL, do_runctl);		/* set/clear stop flag of a process */
+  map(SYS_UPDATE, do_update);		/* update a process into another */
+  map(SYS_STATECTL, do_statectl);	/* let a process control its state */
 
-static void map_signal_handling_calls(void)
-{
-  map(SYS_KILL, do_kill);
-  map(SYS_GETKSIG, do_getksig);
-  map(SYS_ENDKSIG, do_endksig);
-  map(SYS_SIGSEND, do_sigsend);
-  map(SYS_SIGRETURN, do_sigreturn);
-}
+  /* Signal handling. */
+  map(SYS_KILL, do_kill); 		/* cause a process to be signaled */
+  map(SYS_GETKSIG, do_getksig);		/* signal manager checks for signals */
+  map(SYS_ENDKSIG, do_endksig);		/* signal manager finished signal */
+  map(SYS_SIGSEND, do_sigsend);		/* start POSIX-style signal */
+  map(SYS_SIGRETURN, do_sigreturn);	/* return from POSIX-style signal */
 
-static void map_device_io_calls(void)
-{
-  map(SYS_IRQCTL, do_irqctl);
+  /* Device I/O. */
+  map(SYS_IRQCTL, do_irqctl);  		/* interrupt control operations */
 #if defined(__i386__)
-  map(SYS_DEVIO, do_devio);
-  map(SYS_VDEVIO, do_vdevio);
+  map(SYS_DEVIO, do_devio);   		/* inb, inw, inl, outb, outw, outl */
+  map(SYS_VDEVIO, do_vdevio);  		/* vector with devio requests */
 #endif
-}
 
-static void map_memory_management_calls(void)
-{
-  map(SYS_MEMSET, do_memset);
-  map(SYS_VMCTL, do_vmctl);
-}
+  /* Memory management. */
+  map(SYS_MEMSET, do_memset);		/* write char to memory area */
+  map(SYS_VMCTL, do_vmctl);		/* various VM process settings */
 
-static void map_copying_calls(void)
-{
-  map(SYS_UMAP, do_umap);
-  map(SYS_UMAP_REMOTE, do_umap_remote);
-  map(SYS_VUMAP, do_vumap);
-  map(SYS_VIRCOPY, do_vircopy);
-  map(SYS_PHYSCOPY, do_copy);
-  map(SYS_SAFECOPYFROM, do_safecopy_from);
-  map(SYS_SAFECOPYTO, do_safecopy_to);
-  map(SYS_VSAFECOPY, do_vsafecopy);
-}
+  /* Copying. */
+  map(SYS_UMAP, do_umap);		/* map virtual to physical address */
+  map(SYS_UMAP_REMOTE, do_umap_remote);	/* do_umap for non-caller process */
+  map(SYS_VUMAP, do_vumap);		/* vectored virtual to physical map */
+  map(SYS_VIRCOPY, do_vircopy); 	/* use pure virtual addressing */
+  map(SYS_PHYSCOPY, do_copy);	 	/* use physical addressing */
+  map(SYS_SAFECOPYFROM, do_safecopy_from);/* copy with pre-granted permission */
+  map(SYS_SAFECOPYTO, do_safecopy_to);	/* copy with pre-granted permission */
+  map(SYS_VSAFECOPY, do_vsafecopy);	/* vectored safecopy */
 
-static void map_safe_memset_calls(void)
-{
-  map(SYS_SAFEMEMSET, do_safememset);
-}
+  /* safe memset */
+  map(SYS_SAFEMEMSET, do_safememset);	/* safememset */
 
-static void map_clock_functionality_calls(void)
-{
-  map(SYS_TIMES, do_times);
-  map(SYS_SETALARM, do_setalarm);
-  map(SYS_STIME, do_stime);
-  map(SYS_SETTIME, do_settime);
-  map(SYS_VTIMER, do_vtimer);
-}
+  /* Clock functionality. */
+  map(SYS_TIMES, do_times);		/* get uptime and process times */
+  map(SYS_SETALARM, do_setalarm);	/* schedule a synchronous alarm */
+  map(SYS_STIME, do_stime);		/* set the boottime */
+  map(SYS_SETTIME, do_settime);		/* set the system time (realtime) */
+  map(SYS_VTIMER, do_vtimer);		/* set or retrieve a virtual timer */
 
-static void map_system_control_calls(void)
-{
-  map(SYS_ABORT, do_abort);
-  map(SYS_GETINFO, do_getinfo);
-  map(SYS_DIAGCTL, do_diagctl);
-}
+  /* System control. */
+  map(SYS_ABORT, do_abort);		/* abort MINIX */
+  map(SYS_GETINFO, do_getinfo); 	/* request system information */
+  map(SYS_DIAGCTL, do_diagctl);		/* diagnostics-related functionality */
 
-static void map_profiling_calls(void)
-{
-  map(SYS_SPROF, do_sprofile);
-}
+  /* Profiling. */
+  map(SYS_SPROF, do_sprofile);         /* start/stop statistical profiling */
 
-static void map_arm_specific_calls(void)
-{
+  /* arm-specific. */
 #if defined(__arm__)
-  map(SYS_PADCONF, do_padconf);
+  map(SYS_PADCONF, do_padconf);		/* configure pinmux */
 #endif
-}
 
-static void map_i386_specific_calls(void)
-{
+  /* i386-specific. */
 #if defined(__i386__)
-  map(SYS_READBIOS, do_readbios);
-  map(SYS_IOPENABLE, do_iopenable);
-  map(SYS_SDEVIO, do_sdevio);
+  map(SYS_READBIOS, do_readbios);	/* read from BIOS locations */
+  map(SYS_IOPENABLE, do_iopenable); 	/* Enable I/O */
+  map(SYS_SDEVIO, do_sdevio);		/* phys_insb, _insw, _outsb, _outsw */
 #endif
-}
 
-static void map_machine_state_calls(void)
-{
-  map(SYS_SETMCONTEXT, do_setmcontext);
-  map(SYS_GETMCONTEXT, do_getmcontext);
-}
+  /* Machine state switching. */
+  map(SYS_SETMCONTEXT, do_setmcontext); /* set machine context */
+  map(SYS_GETMCONTEXT, do_getmcontext); /* get machine context */
 
-static void map_scheduling_calls(void)
-{
-  map(SYS_SCHEDULE, do_schedule);
-  map(SYS_SCHEDCTL, do_schedctl);
-}
+  /* Scheduling */
+  map(SYS_SCHEDULE, do_schedule);	/* reschedule a process */
+  map(SYS_SCHEDCTL, do_schedctl);	/* change process scheduler */
 
-void system_init(void)
-{
-  init_irq_hooks();
-  init_alarm_timers();
-  init_syscall_vectors();
-
-  map_process_management_calls();
-  map_signal_handling_calls();
-  map_device_io_calls();
-  map_memory_management_calls();
-  map_copying_calls();
-  map_safe_memset_calls();
-  map_clock_functionality_calls();
-  map_system_control_calls();
-  map_profiling_calls();
-  map_arm_specific_calls();
-  map_i386_specific_calls();
-  map_machine_state_calls();
-  map_scheduling_calls();
 }
 /*===========================================================================*
  *				get_priv				     *
  *===========================================================================*/
 int get_priv(
   struct proc *rc,
-  int priv_id
+  const int priv_id
 )
 {
-  struct priv *sp;
+  struct priv *sp = NULL;
 
   if (rc == NULL) {
       return EINVAL;
@@ -316,8 +274,7 @@ int get_priv(
       if (sp >= END_DYN_PRIV_ADDR) {
           return ENOSPC;
       }
-  }
-  else {
+  } else {
       if (!is_static_priv_id(priv_id)) {
           return EINVAL;
       }
@@ -326,6 +283,7 @@ int get_priv(
       }
       sp = &priv[priv_id];
   }
+
   rc->p_priv = sp;
   sp->s_proc_nr = proc_nr(rc);
 
@@ -337,42 +295,30 @@ int get_priv(
  *===========================================================================*/
 void set_sendto_bit(const struct proc *rp, int id)
 {
-    if (rp == NULL) {
-        return;
-    }
+  if (rp == NULL) {
+    return;
+  }
 
-    struct priv *proc_priv = priv(rp);
-    if (proc_priv == NULL) {
-        return;
-    }
+  struct priv *process_priv = priv(rp);
+  if (process_priv == NULL) {
+    return;
+  }
 
-    unsigned int *proc_ipc_to_mask_ptr = proc_priv->s_ipc_to;
+  struct priv *target_priv = NULL;
+  if (id_to_nr(id) != NONE) {
+    target_priv = priv_addr(id);
+  }
 
-    if (id_to_nr(id) == NONE || priv_id(rp) == id) {
-        if (proc_ipc_to_mask_ptr != NULL) {
-            unset_sys_bit(proc_ipc_to_mask_ptr, id);
-        }
-        return;
-    }
+  if (target_priv == NULL || priv_id(rp) == id) {
+	unset_sys_bit(process_priv->s_ipc_to, id);
+	return;
+  }
 
-    if (proc_ipc_to_mask_ptr != NULL) {
-        set_sys_bit(proc_ipc_to_mask_ptr, id);
-    } else {
-        return;
-    }
+  set_sys_bit(process_priv->s_ipc_to, id);
 
-    struct priv *target_priv = priv_addr(id);
-    if (target_priv == NULL) {
-        return;
-    }
-
-    unsigned int *target_ipc_to_mask_ptr = target_priv->s_ipc_to;
-
-    if ((target_priv->s_trap_mask & ~((1U << RECEIVE))) != 0) {
-        if (target_ipc_to_mask_ptr != NULL) {
-            set_sys_bit(target_ipc_to_mask_ptr, priv_id(rp));
-        }
-    }
+  if (target_priv->s_trap_mask & ~((1 << RECEIVE))) {
+      set_sys_bit(target_priv->s_ipc_to, priv_id(rp));
+  }
 }
 
 /*===========================================================================*
@@ -384,29 +330,38 @@ void unset_sendto_bit(const struct proc *rp, int id)
     return;
   }
 
-  if (priv(rp) == NULL) {
+  if (id < 0) {
     return;
   }
 
-  if (priv_addr(id) == NULL) {
+  struct priv *priv_rp = priv(rp);
+  if (priv_rp == NULL) {
     return;
   }
 
-  unset_sys_bit(priv(rp)->s_ipc_to, id);
+  struct priv *priv_id_ptr = priv_addr(id);
+  if (priv_id_ptr == NULL) {
+    return;
+  }
 
-  unset_sys_bit(priv_addr(id)->s_ipc_to, priv_id(rp));
+  int rp_id = priv_id(rp);
+  if (rp_id < 0) {
+    return;
+  }
+
+  unset_sys_bit(priv_rp->s_ipc_to, id);
+
+  unset_sys_bit(priv_id_ptr->s_ipc_to, rp_id);
 }
 
 /*===========================================================================*
  *			      fill_sendto_mask				     *
  *===========================================================================*/
-void fill_sendto_mask(struct proc *rp, const sys_map_t *map)
+void fill_sendto_mask(const struct proc *rp, const sys_map_t *map)
 {
-  if (rp == NULL || map == NULL) {
-    return;
-  }
+  int i;
 
-  for (int i = 0; i < NR_SYS_PROCS; ++i) {
+  for (i = 0; i < NR_SYS_PROCS; i++) {
     if (get_sys_bit(*map, i)) {
       set_sendto_bit(rp, i);
     } else {
@@ -418,10 +373,10 @@ void fill_sendto_mask(struct proc *rp, const sys_map_t *map)
 /*===========================================================================*
  *				send_sig				     *
  *===========================================================================*/
-int send_sig(const endpoint_t ep, const int sig_nr)
+int send_sig(endpoint_t ep, int sig_nr)
 {
   struct proc *rp;
-  struct priv *priv;
+  struct priv *priv_data;
   int proc_nr;
 
   if (!isokendpt(ep, &proc_nr) || isemptyn(proc_nr)) {
@@ -429,13 +384,16 @@ int send_sig(const endpoint_t ep, const int sig_nr)
   }
 
   rp = proc_addr(proc_nr);
-  priv = priv(rp);
-
-  if (priv == NULL) {
+  if (rp == NULL) {
     return ENOENT;
   }
 
-  sigaddset(&priv->s_sig_pending, sig_nr);
+  priv_data = priv(rp);
+  if (priv_data == NULL) {
+    return ENOENT;
+  }
+
+  sigaddset(&priv_data->s_sig_pending, sig_nr);
   mini_notify(proc_addr(SYSTEM), rp->p_endpoint);
 
   return OK;
@@ -447,70 +405,57 @@ int send_sig(const endpoint_t ep, const int sig_nr)
 void cause_sig(proc_nr_t proc_nr, int sig_nr)
 {
   struct proc *rp;
-  struct priv_struct *pp;
   endpoint_t sig_mgr;
-  int sig_mgr_proc_nr;
-  int send_result;
 
   rp = proc_addr(proc_nr);
-  if (rp == NULL) {
-    return;
-  }
+  /* Assuming proc_addr always returns a valid pointer for an active proc_nr. */
 
-  pp = priv(rp);
-  if (pp == NULL) {
-    proc_stacktrace(rp);
-    panic("cause_sig: proc %d (endpoint %d) has NULL priv structure",
-          proc_nr, rp->p_endpoint);
-  }
-
-retry_signal_delivery:;
-
-  sig_mgr = pp->s_sig_mgr;
+  sig_mgr = priv(rp)->s_sig_mgr;
   if (sig_mgr == SELF) {
     sig_mgr = rp->p_endpoint;
   }
 
+  /* If the target process is its own signal manager. */
   if (rp->p_endpoint == sig_mgr) {
     if (SIGS_IS_LETHAL(sig_nr)) {
-      endpoint_t backup_sig_mgr = pp->s_bak_sig_mgr;
-      if (backup_sig_mgr != NONE && isokendpt(backup_sig_mgr, &sig_mgr_proc_nr)) {
-        struct proc *backup_sig_mgr_rp = proc_addr(sig_mgr_proc_nr);
-        if (backup_sig_mgr_rp != NULL) {
-          pp->s_sig_mgr = backup_sig_mgr;
-          pp->s_bak_sig_mgr = NONE;
-          RTS_UNSET(backup_sig_mgr_rp, RTS_NO_PRIV);
-          goto retry_signal_delivery;
-        } else {
-          proc_stacktrace(rp);
-          panic("cause_sig: isokendpt passed for backup_sig_mgr %d but proc_addr failed for %d",
-                backup_sig_mgr, sig_mgr_proc_nr);
-        }
-      } else {
-        proc_stacktrace(rp);
-        panic("cause_sig: sig manager %d gets lethal signal %d for itself, no valid backup",
-              rp->p_endpoint, sig_nr);
+      /* If the signal is lethal, check for a backup signal manager. */
+      endpoint_t backup_sig_mgr = priv(rp)->s_bak_sig_mgr;
+      int backup_sig_mgr_proc_nr;
+
+      if (backup_sig_mgr != NONE && isokendpt(backup_sig_mgr, &backup_sig_mgr_proc_nr)) {
+        struct proc *new_sig_mgr_rp = proc_addr(backup_sig_mgr_proc_nr);
+        /* Assuming new_sig_mgr_rp is valid if isokendpt succeeded. */
+
+        priv(rp)->s_sig_mgr = backup_sig_mgr;
+        priv(rp)->s_bak_sig_mgr = NONE;
+        RTS_UNSET(new_sig_mgr_rp, RTS_NO_PRIV);
+
+        /* Try again with the new signal manager. */
+        cause_sig(proc_nr, sig_nr);
+        return;
       }
-    } else {
-      sigaddset(&pp->s_sig_pending, sig_nr);
-      send_result = send_sig(rp->p_endpoint, SIGKSIGSM);
-      if (OK != send_result) {
-        panic("cause_sig: send_sig to self (SIGKSIGSM) failed for proc %d, endpoint %d: %d",
-              proc_nr, rp->p_endpoint, send_result);
-      }
-      return;
+
+      /* No backup signal manager or backup invalid. Time to panic. */
+      proc_stacktrace(rp);
+      panic("cause_sig: sig manager %d gets lethal signal %d for itself",
+            rp->p_endpoint, sig_nr);
     }
+
+    /* Add the signal to the process's pending signals if not lethal or backup failed. */
+    sigaddset(&priv(rp)->s_sig_pending, sig_nr);
+    if (OK != send_sig(rp->p_endpoint, SIGKSIGSM)) {
+      panic("send_sig failed");
+    }
+    return;
   }
 
+  /* Handle signals for processes managed by an external signal manager. */
   if (!sigismember(&rp->p_pending, sig_nr)) {
     sigaddset(&rp->p_pending, sig_nr);
-
     if (!RTS_ISSET(rp, RTS_SIGNALED)) {
       RTS_SET(rp, RTS_SIGNALED | RTS_SIG_PENDING);
-      send_result = send_sig(sig_mgr, SIGKSIG);
-      if (OK != send_result) {
-        panic("cause_sig: send_sig to signal manager %d failed for proc %d: %d",
-              sig_mgr, rp->p_endpoint, send_result);
+      if (OK != send_sig(sig_mgr, SIGKSIG)) {
+        panic("send_sig failed");
       }
     }
   }
@@ -519,12 +464,14 @@ retry_signal_delivery:;
 /*===========================================================================*
  *				sig_delay_done				     *
  *===========================================================================*/
-void sig_delay_done(struct proc *rp) {
+void sig_delay_done(struct proc *rp)
+{
   if (rp == NULL) {
     return;
   }
 
   rp->p_misc_flags &= ~MF_SIG_DELAY;
+
   cause_sig(proc_nr(rp), SIGSNDELAY);
 }
 
@@ -534,13 +481,21 @@ void sig_delay_done(struct proc *rp) {
 void send_diag_sig(void)
 {
   struct priv *privp;
+  struct proc *p;
+  endpoint_t ep;
 
   for (privp = BEG_PRIV_ADDR; privp < END_PRIV_ADDR; privp++) {
-    if (privp->s_proc_nr != NONE && privp->s_diag_sig == TRUE) {
-      struct proc *target_proc = proc_addr(privp->s_proc_nr);
-      if (target_proc != NULL) {
-        endpoint_t ep = target_proc->p_endpoint;
-        send_sig(ep, SIGKMESS);
+    if (privp->s_proc_nr != NONE && privp->s_diag_sig) {
+      p = proc_addr(privp->s_proc_nr);
+
+      if (p == NULL) {
+        continue;
+      }
+
+      ep = p->p_endpoint;
+
+      if (send_sig(ep, SIGKMESS) != OK) {
+        continue;
       }
     }
   }
@@ -551,20 +506,17 @@ void send_diag_sig(void)
  *===========================================================================*/
 static void clear_memreq(struct proc *rp)
 {
-  struct proc **current_ptr_to_next;
+  struct proc **rpp;
 
   if (!RTS_ISSET(rp, RTS_VMREQUEST)) {
     return;
   }
 
-  current_ptr_to_next = &vmrequest;
-
-  while (*current_ptr_to_next != NULL) {
-    if (*current_ptr_to_next == rp) {
-      *current_ptr_to_next = rp->p_vmrequest.nextrequestor;
+  for (rpp = &vmrequest; *rpp != NULL; rpp = &(*rpp)->p_vmrequest.nextrequestor) {
+    if (*rpp == rp) {
+      *rpp = rp->p_vmrequest.nextrequestor;
       break;
     }
-    current_ptr_to_next = &(*current_ptr_to_next)->p_vmrequest.nextrequestor;
   }
 
   RTS_UNSET(rp, RTS_VMREQUEST);
@@ -577,25 +529,28 @@ static void clear_ipc(
   struct proc *rc
 )
 {
+  struct proc **xpp;
+
   if (RTS_ISSET(rc, RTS_SENDING)) {
       int target_proc_id;
       struct proc *target_proc_ptr;
 
       okendpt(rc->p_sendto_e, &target_proc_id);
+
       target_proc_ptr = proc_addr(target_proc_id);
 
       if (target_proc_ptr != NULL) {
-          struct proc **current_q_ptr = &target_proc_ptr->p_caller_q;
-          while (*current_q_ptr != NULL) {
-              if (*current_q_ptr == rc) {
-                  *current_q_ptr = (*current_q_ptr)->p_q_link;
+          xpp = &target_proc_ptr->p_caller_q;
+          while (*xpp) {
+              if (*xpp == rc) {
+                  *xpp = (*xpp)->p_q_link;
 #if DEBUG_ENABLE_IPC_WARNINGS
 	          printf("endpoint %d / %s removed from queue at %d\n",
 	              rc->p_endpoint, rc->p_name, rc->p_sendto_e);
 #endif
                   break;
               }
-              current_q_ptr = &(*current_q_ptr)->p_q_link;
+              xpp = &(*xpp)->p_q_link;
           }
       }
       RTS_UNSET(rc, RTS_SENDING);
@@ -608,7 +563,7 @@ static void clear_ipc(
  *===========================================================================*/
 void clear_endpoint(struct proc * rc)
 {
-  if(isemptyp(rc)) panic("clear_proc: empty process: %d",  rc->p_endpoint);
+  if(isemptyp(rc)) panic("clear_endpoint: empty process: %d",  rc->p_endpoint);
 
 #if DEBUG_IPC_HOOK
   hook_ipc_clear(rc);
@@ -617,13 +572,11 @@ void clear_endpoint(struct proc * rc)
   RTS_SET(rc, RTS_NO_ENDPOINT);
   if (priv(rc)->s_flags & SYS_PROC)
   {
-	priv(rc)->s_asynsize= 0;
+	priv(rc)->s_asynsize = 0;
   }
 
   clear_ipc(rc);
-
   clear_ipc_refs(rc, EDEADSRCDST);
-
   clear_memreq(rc);
 }
 
@@ -661,16 +614,17 @@ void clear_ipc_refs(
  *===========================================================================*/
 void kernel_call_resume(struct proc *caller)
 {
-    assert(!RTS_ISSET(caller, RTS_SLOT_FREE));
-    assert(!RTS_ISSET(caller, RTS_VMREQUEST));
-    assert(caller->p_vmrequest.saved.reqmsg.m_source == caller->p_endpoint);
+	int result;
+	struct message *reqmsg = &caller->p_vmrequest.saved.reqmsg;
 
-    message *req_msg = &caller->p_vmrequest.saved.reqmsg;
-    int result;
+	assert(!RTS_ISSET(caller, RTS_SLOT_FREE));
+	assert(!RTS_ISSET(caller, RTS_VMREQUEST));
 
-    result = kernel_call_dispatch(caller, req_msg);
-    caller->p_misc_flags &= ~MF_KCALL_RESUME;
-    kernel_call_finish(caller, req_msg, result);
+	assert(reqmsg->m_source == caller->p_endpoint);
+
+	result = kernel_call_dispatch(caller, reqmsg);
+	caller->p_misc_flags &= ~MF_KCALL_RESUME;
+	kernel_call_finish(caller, reqmsg, result);
 }
 
 /*===========================================================================*
@@ -678,55 +632,78 @@ void kernel_call_resume(struct proc *caller)
  *===========================================================================*/
 int sched_proc(struct proc *p, int priority, int quantum, int cpu, int niced)
 {
+	if (p == NULL) {
+		return EINVAL;
+	}
+
+	// Validate priority parameter: must be within allowed range or -1 (no change).
 	if (priority != -1 && (priority < TASK_Q || priority > NR_SCHED_QUEUES)) {
 		return EINVAL;
 	}
 
+	// Validate quantum parameter: must be at least 1 or -1 (no change).
 	if (quantum != -1 && quantum < 1) {
 		return EINVAL;
 	}
 
 #ifdef CONFIG_SMP
+	// Validate CPU parameter: must be within [0, ncpus-1] or -1 (no change).
 	if (cpu != -1) {
-		if (cpu < 0 || (unsigned int)cpu >= ncpus) {
+		if (cpu < 0 || (unsigned)cpu >= ncpus) {
 			return EINVAL;
 		}
+		// Check if the target CPU is ready.
 		if (!cpu_is_ready(cpu)) {
 			return EBADCPU;
 		}
 	}
 #endif
 
-	if (proc_is_runnable(p)) {
+	// Determine if the process is currently runnable.
+	// If it is, we temporarily dequeue it before modifying its scheduling parameters
+	// to prevent race conditions and ensure it's re-enqueued correctly.
+	bool was_runnable = proc_is_runnable(p);
+
+	if (was_runnable) {
 #ifdef CONFIG_SMP
+		// Handle process migration if a new CPU is specified and differs from its current CPU,
+		// and the process is currently running on a different CPU than the current one (cpuid).
+		// This specific condition for migration is preserved from the original code.
 		if (p->p_cpu != cpuid && cpu != -1 && cpu != p->p_cpu) {
 			smp_schedule_migrate_proc(p, cpu);
 		}
 #endif
+		// Mark the process as temporarily not eligible for scheduling.
+		// This flag will be cleared at the end of the function to allow re-enqueuing.
 		RTS_SET(p, RTS_NO_QUANTUM);
 	}
 
+	// Update process scheduling parameters based on provided values.
+	// A value of -1 indicates no change for that parameter.
 	if (priority != -1) {
 		p->p_priority = priority;
 	}
-
 	if (quantum != -1) {
 		p->p_quantum_size_ms = quantum;
 		p->p_cpu_time_left = ms_2_cpu_time(quantum);
 	}
-
 #ifdef CONFIG_SMP
 	if (cpu != -1) {
 		p->p_cpu = cpu;
 	}
 #endif
 
+	// Update the niceness flag.
 	if (niced) {
 		p->p_misc_flags |= MF_NICED;
 	} else {
 		p->p_misc_flags &= ~MF_NICED;
 	}
 
+	// Clear the RTS_NO_QUANTUM flag.
+	// This action is unconditional, as in the original code, implying that
+	// the scheduler will re-evaluate the process's state and potentially
+	// re-enqueue it into the appropriate run queue based on its new parameters.
 	RTS_UNSET(p, RTS_NO_QUANTUM);
 
 	return OK;
@@ -735,48 +712,53 @@ int sched_proc(struct proc *p, int priority, int quantum, int cpu, int niced)
 /*===========================================================================*
  *				add_ipc_filter				     *
  *===========================================================================*/
-int add_ipc_filter(struct proc *rp, int type, vir_bytes address,
-	size_t length)
+int add_ipc_filter(struct proc *rp, int type, vir_bytes address, size_t length)
 {
-	if (type != IPCF_BLACKLIST && type != IPCF_WHITELIST) {
-		return EINVAL;
-	}
+    int num_elements;
+    int r;
+    ipc_filter_t *ipcf;
+    ipc_filter_t **ipcfp;
 
-	if (length % sizeof(ipc_filter_el_t) != 0) {
-		return EINVAL;
-	}
+    if (type != IPCF_BLACKLIST && type != IPCF_WHITELIST) {
+        return EINVAL;
+    }
 
-	int num_elements = length / sizeof(ipc_filter_el_t);
-	if (num_elements <= 0 || num_elements > IPCF_MAX_ELEMENTS) {
-		return E2BIG;
-	}
+    if (length == 0 || length % sizeof(ipc_filter_el_t) != 0) {
+        return EINVAL;
+    }
 
-	ipc_filter_t *ipcf;
-	IPCF_POOL_ALLOCATE_SLOT(type, &ipcf);
-	if (ipcf == NULL) {
-		return ENOMEM;
-	}
+    num_elements = length / sizeof(ipc_filter_el_t);
+    if (num_elements > IPCF_MAX_ELEMENTS) {
+        return E2BIG;
+    }
 
-	ipcf->num_elements = num_elements;
-	ipcf->next = NULL;
+    IPCF_POOL_ALLOCATE_SLOT(type, &ipcf);
+    if (ipcf == NULL) {
+        return ENOMEM;
+    }
 
-	int r = data_copy(rp->p_endpoint, address, KERNEL, (vir_bytes)ipcf->elements, length);
-	if (r == OK) {
-		r = check_ipc_filter(ipcf, 1 /*fill_flags*/);
-	}
+    ipcf->num_elements = num_elements;
+    ipcf->next = NULL;
 
-	if (r != OK) {
-		IPCF_POOL_FREE_SLOT(ipcf);
-		return r;
-	}
+    r = data_copy(rp->p_endpoint, address, KERNEL, (vir_bytes)ipcf->elements, length);
+    if (r != OK) {
+        IPCF_POOL_FREE_SLOT(ipcf);
+        return r;
+    }
 
-	ipc_filter_t **current_ipcfp = &priv(rp)->s_ipcf;
-	while (*current_ipcfp != NULL) {
-		current_ipcfp = &(*current_ipcfp)->next;
-	}
-	*current_ipcfp = ipcf;
+    r = check_ipc_filter(ipcf, TRUE);
+    if (r != OK) {
+        IPCF_POOL_FREE_SLOT(ipcf);
+        return r;
+    }
 
-	return OK;
+    ipcfp = &priv(rp)->s_ipcf;
+    while (*ipcfp != NULL) {
+        ipcfp = &(*ipcfp)->next;
+    }
+    *ipcfp = ipcf;
+
+    return OK;
 }
 
 /*===========================================================================*
@@ -784,22 +766,20 @@ int add_ipc_filter(struct proc *rp, int type, vir_bytes address,
  *===========================================================================*/
 void clear_ipc_filters(struct proc *rp)
 {
-	ipc_filter_t *ipcf_current;
-	ipc_filter_t *ipcf_next;
+	ipc_filter_t *ipcf_node;
 
-	ipcf_current = priv(rp)->s_ipcf;
-
-	while (ipcf_current != NULL) {
-		ipcf_next = ipcf_current->next;
-		IPCF_POOL_FREE_SLOT(ipcf_current);
-		ipcf_current = ipcf_next;
+	ipcf_node = priv(rp)->s_ipcf;
+	while (ipcf_node != NULL) {
+		ipc_filter_t *next_node = ipcf_node->next;
+		IPCF_POOL_FREE_SLOT(ipcf_node);
+		ipcf_node = next_node;
 	}
 
 	priv(rp)->s_ipcf = NULL;
 
 	if (rp->p_endpoint == VM_PROC_NR && vmrequest != NULL) {
 		if (send_sig(VM_PROC_NR, SIGKMEM) != OK) {
-			panic("send_sig to VM_PROC_NR failed after clearing IPC filters");
+			panic("send_sig failed");
 		}
 	}
 }
@@ -807,28 +787,33 @@ void clear_ipc_filters(struct proc *rp)
 /*===========================================================================*
  *				check_ipc_filter			     *
  *===========================================================================*/
-int check_ipc_filter(ipc_filter_t *ipcf, const int fill_flags)
+int check_ipc_filter(ipc_filter_t *ipcf, int fill_flags)
 {
     if (ipcf == NULL) {
         return OK;
     }
 
+    if (ipcf->num_elements < 0) {
+        return EINVAL;
+    }
+
     int accumulated_flags = 0;
-    const int num_elements = ipcf->num_elements;
+    int num_elements = ipcf->num_elements;
 
-    for (int i = 0; i < num_elements; ++i) {
-        ipc_filter_el_t *ipcf_el = &ipcf->elements[i];
-
-        if (!IPCF_EL_CHECK(ipcf_el)) {
+    for (size_t i = 0; i < (size_t)num_elements; ++i) {
+        const ipc_filter_el_t *current_element = &ipcf->elements[i];
+        if (!IPCF_EL_CHECK(current_element)) {
             return EINVAL;
         }
-        accumulated_flags |= ipcf_el->flags;
+        accumulated_flags |= current_element->flags;
     }
 
     if (fill_flags) {
         ipcf->flags = accumulated_flags;
-    } else if (ipcf->flags != accumulated_flags) {
-        return EINVAL;
+    } else {
+        if (ipcf->flags != accumulated_flags) {
+            return EINVAL;
+        }
     }
 
     return OK;
@@ -840,75 +825,88 @@ int check_ipc_filter(ipc_filter_t *ipcf, const int fill_flags)
 int allow_ipc_filtered_msg(struct proc *rp, endpoint_t src_e,
 	vir_bytes m_src_v, message *m_src_p)
 {
-	int i, r;
-	ipc_filter_t *ipcf_head, *current_ipcf;
-	ipc_filter_el_t *ipcf_el;
-	message m_buff;
-	int allow;
-	int need_mtype;
+	ipc_filter_t *ipcf_list_head;
+	ipc_filter_t *current_filter;
+	ipc_filter_el_t *filter_element;
+	message m_buffer;
+	int result_code;
+	int num_elements;
+	int get_message_type = FALSE;
+	int is_allowed;
 
-	ipcf_head = priv(rp)->s_ipcf;
-	if (ipcf_head == NULL) {
-		return 1;
+	ipcf_list_head = priv(rp)->s_ipcf;
+
+	if (ipcf_list_head == NULL) {
+		return TRUE; /* No IPC filters, always allow */
 	}
 
-	need_mtype = 0;
-#ifdef DEBUG_DUMPIPCF
-	need_mtype = 1;
+	/* Determine if the message type needs to be copied. */
+	/* Iterate through the filter list to see if any filter checks m_type. */
+	current_filter = ipcf_list_head;
+	while (current_filter != NULL) {
+#if DEBUG_DUMPIPCF
+		get_message_type = TRUE; /* If debug is on, always copy the type */
+		break;
 #else
-	current_ipcf = ipcf_head;
-	while (current_ipcf != NULL) {
-		if (current_ipcf->flags & IPCF_MATCH_M_TYPE) {
-			need_mtype = 1;
+		if (current_filter->flags & IPCF_MATCH_M_TYPE) {
+			get_message_type = TRUE;
 			break;
 		}
-		current_ipcf = current_ipcf->next;
-	}
 #endif
+		current_filter = current_filter->next;
+	}
 
+	/* If m_src_p is NULL, the message data is in the process's address space (m_src_v). */
+	/* We need to copy at least the m_type if any filter requires it. */
 	if (m_src_p == NULL) {
 		assert(m_src_v != 0);
 
-		memset(&m_buff, 0, sizeof(m_buff));
-
-		if (need_mtype) {
-			r = data_copy(src_e,
+		if (get_message_type) {
+			result_code = data_copy(src_e,
 			    m_src_v + offsetof(message, m_type), KERNEL,
-			    (vir_bytes)&m_buff.m_type, sizeof(m_buff.m_type));
-			if (r != OK) {
-				return 1;
+			    (vir_bytes)&m_buffer.m_type, sizeof(m_buffer.m_type));
+			if (result_code != OK) {
+				/* Preserving original behavior: allow message if m_type copy fails. */
+				return TRUE;
 			}
 		}
-		m_src_p = &m_buff;
+		m_src_p = &m_buffer; /* Point to our local buffer for filtering */
 	}
 
+	/* Ensure m_source is set correctly in the message being evaluated. */
 	m_src_p->m_source = src_e;
 
-	current_ipcf = ipcf_head;
+	/* Initialize the 'is_allowed' state based on the first filter's type. */
+	is_allowed = (ipcf_list_head->type == IPCF_BLACKLIST);
 
-	allow = (current_ipcf->type == IPCF_BLACKLIST);
+	/* Iterate through all IPC filters to apply rules. */
+	current_filter = ipcf_list_head;
+	while (current_filter != NULL) {
+		/* Only evaluate a filter if it has the potential to change the current 'is_allowed' state. */
+		/* If current_filter is WHITELIST and we are currently denying (!is_allowed), */
+		/* or if current_filter is BLACKLIST and we are currently allowing (is_allowed). */
+		if ((current_filter->type == IPCF_WHITELIST && !is_allowed) ||
+		    (current_filter->type == IPCF_BLACKLIST && is_allowed)) {
 
-	while (current_ipcf != NULL) {
-		if ((current_ipcf->type == IPCF_WHITELIST && !allow) ||
-		    (current_ipcf->type == IPCF_BLACKLIST && allow)) {
+			num_elements = current_filter->num_elements;
+			for (int i = 0; i < num_elements; i++) {
+				filter_element = &current_filter->elements[i];
 
-			for (i = 0; i < current_ipcf->num_elements; i++) {
-				ipcf_el = &current_ipcf->elements[i];
-				if (IPCF_EL_MATCH(ipcf_el, m_src_p)) {
-					allow = (current_ipcf->type == IPCF_WHITELIST);
-					break;
+				if (IPCF_EL_MATCH(filter_element, m_src_p)) {
+					/* A match was found, update 'is_allowed' based on this filter's type. */
+					is_allowed = (current_filter->type == IPCF_WHITELIST);
+					break; /* Matched an element, no need to check others in THIS filter */
 				}
 			}
 		}
-		current_ipcf = current_ipcf->next;
+		current_filter = current_filter->next; /* Move to the next filter in the chain */
 	}
 
-#ifdef DEBUG_DUMPIPCF
-	printmsg(m_src_p, proc_addr(_ENDPOINT_P(src_e)), rp, allow ? '+' : '-',
-	    1);
+#if DEBUG_DUMPIPCF
+	printmsg(m_src_p, proc_addr(_ENDPOINT_P(src_e)), rp, is_allowed ? '+' : '-', TRUE /*printparams*/);
 #endif
 
-	return allow;
+	return is_allowed;
 }
 
 /*===========================================================================*
@@ -916,15 +914,24 @@ int allow_ipc_filtered_msg(struct proc *rp, endpoint_t src_e,
  *===========================================================================*/
 int allow_ipc_filtered_memreq(struct proc *src_rp, struct proc *dst_rp)
 {
-	struct proc *vmp = proc_addr(VM_PROC_NR);
+	struct proc *vmp;
+	message m_notification;
+
+	vmp = proc_addr(VM_PROC_NR);
+	if (vmp == NULL) {
+		return FALSE;
+	}
 
 	if (priv(vmp)->s_ipcf == NULL) {
 		return TRUE;
 	}
 
-	message m_buf;
-	m_buf.m_type = NOTIFY_MESSAGE;
-	return allow_ipc_filtered_msg(vmp, SYSTEM, 0, &m_buf);
+	m_notification.m_type = NOTIFY_MESSAGE;
+	if (!allow_ipc_filtered_msg(vmp, SYSTEM, 0, &m_notification)) {
+		return FALSE;
+	}
+
+	return TRUE;
 }
 
 /*===========================================================================*
@@ -932,61 +939,58 @@ int allow_ipc_filtered_memreq(struct proc *src_rp, struct proc *dst_rp)
  *===========================================================================*/
 int priv_add_irq(struct proc *rp, int irq)
 {
-    struct priv *priv = priv(rp);
+    struct priv *proc_priv = priv(rp);
 
-    priv->s_flags |= CHECK_IRQ;
+    proc_priv->s_flags |= CHECK_IRQ;
 
-    for (int i = 0; i < priv->s_nr_irq; i++) {
-        if (priv->s_irq_tab[i] == irq) {
+    for (int i = 0; i < proc_priv->s_nr_irq; ++i) {
+        if (proc_priv->s_irq_tab[i] == irq) {
             return OK;
         }
     }
 
-    if (priv->s_nr_irq >= NR_IRQ) {
-        printf("do_privctl: %d already has %d irq's.\n",
-               rp->p_endpoint, priv->s_nr_irq);
+    if (proc_priv->s_nr_irq >= NR_IRQ) {
+        printf("do_privctl: Process %d already has %d IRQs. Maximum capacity of %d reached.\n",
+               rp->p_endpoint, proc_priv->s_nr_irq, NR_IRQ);
         return ENOMEM;
     }
 
-    priv->s_irq_tab[priv->s_nr_irq] = irq;
-    priv->s_nr_irq++;
+    proc_priv->s_irq_tab[proc_priv->s_nr_irq] = irq;
+    proc_priv->s_nr_irq++;
+
     return OK;
 }
 
 /*===========================================================================*
  *                             priv_add_io                                   *
  *===========================================================================*/
-int priv_add_io(struct proc *rp, struct io_range *ior)
+int priv_add_io(struct proc *rp, const struct io_range *ior)
 {
-    if (rp == NULL) {
-        return EFAULT;
-    }
-    if (ior == NULL) {
-        return EFAULT;
+    if (rp == NULL || ior == NULL) {
+        return EINVAL;
     }
 
-    struct priv *priv_data = priv(rp);
-    if (priv_data == NULL) {
-        return ENOENT;
+    struct priv *p_priv = priv(rp);
+
+    if (p_priv == NULL) {
+        return ENXIO;
     }
 
-    priv_data->s_flags |= CHECK_IO_PORT;
+    p_priv->s_flags |= CHECK_IO_PORT;
 
-    for (int i = 0; i < priv_data->s_nr_io_range; i++) {
-        if (priv_data->s_io_tab[i].ior_base == ior->ior_base &&
-            priv_data->s_io_tab[i].ior_limit == ior->ior_limit) {
+    for (int i = 0; i < p_priv->s_nr_io_range; ++i) {
+        if (p_priv->s_io_tab[i].ior_base == ior->ior_base &&
+            p_priv->s_io_tab[i].ior_limit == ior->ior_limit) {
             return OK;
         }
     }
 
-    if (priv_data->s_nr_io_range >= NR_IO_RANGE) {
-        printf("do_privctl: %d already has %d i/o ranges.\n",
-               rp->p_endpoint, priv_data->s_nr_io_range);
+    if (p_priv->s_nr_io_range >= NR_IO_RANGE) {
         return ENOMEM;
     }
 
-    priv_data->s_io_tab[priv_data->s_nr_io_range] = *ior;
-    priv_data->s_nr_io_range++;
+    p_priv->s_io_tab[p_priv->s_nr_io_range] = *ior;
+    p_priv->s_nr_io_range++;
 
     return OK;
 }
@@ -996,25 +1000,26 @@ int priv_add_io(struct proc *rp, struct io_range *ior)
  *===========================================================================*/
 int priv_add_mem(struct proc *rp, struct minix_mem_range *memr)
 {
-        struct priv *priv_ptr = priv(rp);
+        struct priv *priv = priv(rp);
         int i;
 
-	priv_ptr->s_flags |= CHECK_MEM;
+	priv->s_flags |= CHECK_MEM;
 
-	for (i = 0; i < priv_ptr->s_nr_mem_range; i++) {
-		if (priv_ptr->s_mem_tab[i].mr_base == memr->mr_base &&
-		    priv_ptr->s_mem_tab[i].mr_limit == memr->mr_limit) {
+	for (i = 0; i < priv->s_nr_mem_range; i++) {
+		if (priv->s_mem_tab[i].mr_base == memr->mr_base &&
+			priv->s_mem_tab[i].mr_limit == memr->mr_limit)
 			return OK;
-		}
 	}
 
-	if (priv_ptr->s_nr_mem_range >= NR_MEM_RANGE) {
+	/* At this point, 'i' holds the value of priv->s_nr_mem_range,
+	 * representing both the current count and the next available index. */
+	if (i >= NR_MEM_RANGE) {
+		printf("do_privctl: %d already has %d mem ranges.\n",
+			rp->p_endpoint, i);
 		return ENOMEM;
 	}
-
-	priv_ptr->s_mem_tab[priv_ptr->s_nr_mem_range] = *memr;
-	priv_ptr->s_nr_mem_range++;
-
+	priv->s_mem_tab[i]= *memr;
+	priv->s_nr_mem_range++;
 	return OK;
 }
 
